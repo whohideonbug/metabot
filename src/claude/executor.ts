@@ -1,7 +1,9 @@
 import { execSync, spawn } from 'node:child_process';
+import { once } from 'node:events';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import type { SDKUserMessage, SpawnOptions, SpawnedProcess } from '@anthropic-ai/claude-agent-sdk';
@@ -174,24 +176,8 @@ export class ClaudeExecutor {
     private logger: Logger,
   ) {}
 
-  private buildQueryOptions(cwd: string, sessionId: string | undefined, abortController: AbortController, outputsDir?: string, apiContext?: ApiContext): Record<string, unknown> {
-    const queryOptions: Record<string, unknown> = {
-      permissionMode: 'bypassPermissions' as const,
-      allowDangerouslySkipPermissions: true,
-      cwd,
-      abortController,
-      includePartialMessages: true,
-      // Load MCP servers and settings from user/project config files
-      settingSources: ['user', 'project'],
-      // Cross-platform spawn: custom spawn filters CLAUDE* env vars and uses
-      // process.execPath to avoid PATH issues on Windows; fileURLToPath converts
-      // file:// URLs to native paths for the SDK CLI entrypoint.
-      spawnClaudeCodeProcess: createSpawnFn(this.config.claude.apiKey),
-      executableArgs: [path.join(path.dirname(fileURLToPath(import.meta.resolve('@anthropic-ai/claude-agent-sdk'))), 'cli.js')],
-      pathToClaudeCodeExecutable: CLAUDE_EXECUTABLE,
-    };
-
-    // Build system prompt appendix from sections
+  /** Shared system-prompt sections for SDK `query()` and `cliExecute()`. */
+  private buildAppendSections(outputsDir?: string, apiContext?: ApiContext): string[] {
     const appendSections: string[] = [];
 
     if (outputsDir) {
@@ -222,6 +208,70 @@ export class ClaudeExecutor {
       }
     }
 
+    return appendSections;
+  }
+
+  /** Environment for a direct `claude` subprocess (inherits `process.env`, optional API key from bot config). */
+  private buildCliEnv(): Record<string, string> {
+    const env: Record<string, string> = {};
+    for (const [k, v] of Object.entries(process.env)) {
+      if (v !== undefined) env[k] = v;
+    }
+    if (this.config.claude.apiKey) {
+      env.ANTHROPIC_API_KEY = this.config.claude.apiKey;
+    }
+    return env;
+  }
+
+  /**
+   * Args for `claude -p` (print mode) with stream-json, aligned with `execute()` / `buildQueryOptions`
+   * (same append sections as SDK path; no `apiContext` — same as `execute()`).
+   */
+  private buildCliArgs(prompt: string, sessionId: string | undefined, outputsDir?: string): string[] {
+    const args: string[] = [
+      '-p',
+      '--output-format', 'stream-json',
+      '--include-partial-messages',
+      '--permission-mode', 'bypassPermissions',
+      '--dangerously-skip-permissions',
+      '--setting-sources', 'user,project',
+      '--betas', 'context-1m-2025-08-07',
+    ];
+    const appendSections = this.buildAppendSections(outputsDir, undefined);
+    if (appendSections.length > 0) {
+      args.push('--append-system-prompt', appendSections.join('\n\n'));
+    }
+    if (sessionId) {
+      args.push('--resume', sessionId);
+    }
+    if (this.config.claude.model) {
+      args.push('--model', this.config.claude.model);
+    }
+    if (this.config.claude.maxBudgetUsd !== undefined) {
+      args.push('--max-budget-usd', String(this.config.claude.maxBudgetUsd));
+    }
+    args.push(prompt);
+    return args;
+  }
+
+  private buildQueryOptions(cwd: string, sessionId: string | undefined, abortController: AbortController, outputsDir?: string, apiContext?: ApiContext): Record<string, unknown> {
+    const queryOptions: Record<string, unknown> = {
+      permissionMode: 'bypassPermissions' as const,
+      allowDangerouslySkipPermissions: true,
+      cwd,
+      abortController,
+      includePartialMessages: true,
+      // Load MCP servers and settings from user/project config files
+      settingSources: ['user', 'project'],
+      // Cross-platform spawn: custom spawn filters CLAUDE* env vars and uses
+      // process.execPath to avoid PATH issues on Windows; fileURLToPath converts
+      // file:// URLs to native paths for the SDK CLI entrypoint.
+      spawnClaudeCodeProcess: createSpawnFn(this.config.claude.apiKey),
+      executableArgs: [path.join(path.dirname(fileURLToPath(import.meta.resolve('@anthropic-ai/claude-agent-sdk'))), 'cli.js')],
+      pathToClaudeCodeExecutable: CLAUDE_EXECUTABLE,
+    };
+
+    const appendSections = this.buildAppendSections(outputsDir, apiContext);
     if (appendSections.length > 0) {
       queryOptions.systemPrompt = {
         type: 'preset',
@@ -253,10 +303,83 @@ export class ClaudeExecutor {
     return queryOptions;
   }
 
+  /**
+   * Default request entrypoint: tries the environment `claude` CLI first (single-turn, `-p` mode),
+   * and only falls back to the SDK `query()` multi-turn path if the CLI fails before producing
+   * any progress. When CLI succeeds, `sendAnswer`/`finish` become no-ops (CLI is single-turn);
+   * when the stream falls back to the SDK path, they are wired to the SDK input queue as before.
+   */
   startExecution(options: ExecutorOptions): ExecutionHandle {
+    const { cwd, sessionId, abortController, outputsDir } = options;
+
+    this.logger.info({ cwd, hasSession: !!sessionId, outputsDir }, 'Starting Claude execution (CLI-first, multi-turn fallback)');
+
+    const logger = this.logger;
+    const cliStream = this.cliExecute(options);
+
+    let sdkHandle: ExecutionHandle | null = null;
+    const self = this;
+
+    async function* combinedStream(): AsyncGenerator<SDKMessage> {
+      let yieldedProgress = false;
+      let fallbackReason: string | null = null;
+
+      try {
+        for await (const msg of cliStream) {
+          if (!yieldedProgress && msg.type === 'result' && msg.is_error) {
+            fallbackReason = msg.result || msg.errors?.join('; ') || 'cli result error';
+            break;
+          }
+          yield msg;
+          if (
+            msg.type === 'system' ||
+            msg.type === 'assistant' ||
+            msg.type === 'stream_event' ||
+            (msg.type === 'result' && !msg.is_error)
+          ) {
+            yieldedProgress = true;
+          }
+        }
+      } catch (err: any) {
+        if (err?.name === 'AbortError' || abortController.signal.aborted) {
+          return;
+        }
+        if (yieldedProgress) {
+          throw err;
+        }
+        fallbackReason = String(err?.message ?? err);
+      }
+
+      if (fallbackReason !== null && !yieldedProgress && !abortController.signal.aborted) {
+        logger.warn({ reason: fallbackReason }, 'CLI execution failed, falling back to SDK query() multi-turn');
+        sdkHandle = self.startSdkExecution(options);
+        yield* sdkHandle.stream;
+      }
+    }
+
+    return {
+      stream: combinedStream(),
+      sendAnswer: (toolUseId: string, sid: string, answerText: string) => {
+        if (sdkHandle) {
+          sdkHandle.sendAnswer(toolUseId, sid, answerText);
+        } else {
+          logger.warn({ toolUseId }, 'sendAnswer ignored (CLI mode is single-turn)');
+        }
+      },
+      finish: () => {
+        if (sdkHandle) sdkHandle.finish();
+      },
+    };
+  }
+
+  /**
+   * Original SDK `query()`-based multi-turn execution (preserved). Exposed so the bridge can call
+   * it directly when needed, and used internally by `startExecution()` as the CLI fallback.
+   */
+  startSdkExecution(options: ExecutorOptions): ExecutionHandle {
     const { prompt, cwd, sessionId, abortController, outputsDir, apiContext } = options;
 
-    this.logger.info({ cwd, hasSession: !!sessionId, outputsDir }, 'Starting Claude execution (multi-turn)');
+    this.logger.info({ cwd, hasSession: !!sessionId, outputsDir }, 'Starting Claude SDK execution (multi-turn)');
 
     const inputQueue = new AsyncQueue<SDKUserMessage>();
 
@@ -391,6 +514,109 @@ export class ClaudeExecutor {
         return;
       }
       throw err;
+    }
+  }
+
+  /**
+   * Same contract as `execute()` but runs the environment `claude` binary with `-p` and `--output-format stream-json`,
+   * parsing NDJSON lines into `SDKMessage` (for `StreamProcessor`). No Agent SDK subprocess.
+   */
+  async *cliExecute(options: ExecutorOptions): AsyncGenerator<SDKMessage> {
+    const { prompt, cwd, sessionId, abortController, outputsDir } = options;
+
+    this.logger.info(
+      { cwd, hasSession: !!sessionId, claudePath: CLAUDE_EXECUTABLE },
+      'Starting Claude CLI execute (-p stream-json)',
+    );
+
+    if (abortController.signal.aborted) {
+      return;
+    }
+
+    const args = this.buildCliArgs(prompt, sessionId, outputsDir);
+    const child = spawn(CLAUDE_EXECUTABLE, args, {
+      cwd,
+      env: this.buildCliEnv(),
+      signal: abortController.signal,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    let stderr = '';
+    child.stderr?.on('data', (chunk: unknown) => {
+      stderr += String(chunk);
+    });
+
+    const abortPromise = new Promise<never>((_, reject) => {
+      if (abortController.signal.aborted) {
+        reject(new DOMException('Aborted', 'AbortError'));
+        return;
+      }
+      abortController.signal.addEventListener('abort', () => {
+        reject(new DOMException('Aborted', 'AbortError'));
+      }, { once: true });
+    });
+
+    const rl = readline.createInterface({
+      input: child.stdout!,
+      crlfDelay: Infinity,
+    });
+
+    try {
+      const iterator = rl[Symbol.asyncIterator]();
+      while (true) {
+        const result = await Promise.race([iterator.next(), abortPromise]);
+        if (result.done) break;
+        const line = result.value as string;
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try {
+          yield JSON.parse(trimmed) as SDKMessage;
+        } catch {
+          this.logger.debug({ line: trimmed.slice(0, 120) }, 'cliExecute: skip non-JSON line');
+        }
+      }
+    } catch (err: any) {
+      if (err.name === 'AbortError' || abortController.signal.aborted) {
+        this.logger.info('Claude CLI execution aborted');
+        return;
+      }
+      throw err;
+    } finally {
+      rl.close();
+    }
+
+    let exitCode: number | null = null;
+    try {
+      const exitPromise = once(child, 'exit');
+      const errorPromise = new Promise<never>((_, reject) => {
+        child.once('error', reject);
+      });
+      const [code] = await Promise.race([exitPromise, errorPromise]);
+      exitCode = code;
+    } catch (err: any) {
+      if (err.name === 'AbortError' || abortController.signal.aborted) {
+        return;
+      }
+      this.logger.warn({ err }, 'cliExecute: process error');
+      yield {
+        type: 'result',
+        subtype: 'error',
+        is_error: true,
+        result: String(err?.message ?? err),
+        errors: [String(err?.message ?? err)],
+      } as SDKMessage;
+      return;
+    }
+
+    if (exitCode !== 0 && exitCode !== null && !abortController.signal.aborted) {
+      this.logger.warn({ exitCode, stderr: stderr.slice(-2000) }, 'cliExecute: non-zero exit');
+      yield {
+        type: 'result',
+        subtype: 'error',
+        is_error: true,
+        result: stderr || `claude exited with code ${exitCode}`,
+        errors: [stderr || `exit ${exitCode}`],
+      } as SDKMessage;
     }
   }
 }
