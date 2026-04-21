@@ -312,7 +312,10 @@ export class ClaudeExecutor {
   startExecution(options: ExecutorOptions): ExecutionHandle {
     const { cwd, sessionId, abortController, outputsDir } = options;
 
-    this.logger.info({ cwd, hasSession: !!sessionId, outputsDir }, 'Starting Claude execution (CLI-first, multi-turn fallback)');
+    this.logger.info(
+      { mode: 'cli-first', cwd, hasSession: !!sessionId, outputsDir },
+      '[claude] startExecution: trying CLI first, SDK query() multi-turn fallback',
+    );
 
     const logger = this.logger;
     const cliStream = this.cliExecute(options);
@@ -351,7 +354,7 @@ export class ClaudeExecutor {
       }
 
       if (fallbackReason !== null && !yieldedProgress && !abortController.signal.aborted) {
-        logger.warn({ reason: fallbackReason }, 'CLI execution failed, falling back to SDK query() multi-turn');
+        logger.warn({ mode: 'cli->sdk', reason: fallbackReason }, '[claude] CLI failed with no progress, falling back to SDK query() multi-turn');
         sdkHandle = self.startSdkExecution(options);
         yield* sdkHandle.stream;
       }
@@ -363,7 +366,7 @@ export class ClaudeExecutor {
         if (sdkHandle) {
           sdkHandle.sendAnswer(toolUseId, sid, answerText);
         } else {
-          logger.warn({ toolUseId }, 'sendAnswer ignored (CLI mode is single-turn)');
+          logger.warn({ mode: 'cli', toolUseId }, '[claude] sendAnswer ignored (CLI mode is single-turn)');
         }
       },
       finish: () => {
@@ -379,7 +382,19 @@ export class ClaudeExecutor {
   startSdkExecution(options: ExecutorOptions): ExecutionHandle {
     const { prompt, cwd, sessionId, abortController, outputsDir, apiContext } = options;
 
-    this.logger.info({ cwd, hasSession: !!sessionId, outputsDir }, 'Starting Claude SDK execution (multi-turn)');
+    this.logger.info(
+      {
+        mode: 'sdk',
+        cwd,
+        hasSession: !!sessionId,
+        outputsDir,
+        promptChars: prompt.length,
+        model: options.model ?? this.config.claude.model,
+        maxTurns: options.maxTurns ?? this.config.claude.maxTurns,
+        allowedTools: options.allowedTools,
+      },
+      '[claude] invoking SDK query() (multi-turn)',
+    );
 
     const inputQueue = new AsyncQueue<SDKUserMessage>();
 
@@ -477,7 +492,16 @@ export class ClaudeExecutor {
   async *execute(options: ExecutorOptions): AsyncGenerator<SDKMessage> {
     const { prompt, cwd, sessionId, abortController, outputsDir } = options;
 
-    this.logger.info({ cwd, hasSession: !!sessionId }, 'Starting Claude execution');
+    this.logger.info(
+      {
+        mode: 'sdk',
+        cwd,
+        hasSession: !!sessionId,
+        promptChars: prompt.length,
+        model: this.config.claude.model,
+      },
+      '[claude] invoking SDK query() (single-turn)',
+    );
 
     const queryOptions = this.buildQueryOptions(cwd, sessionId, abortController, outputsDir);
 
@@ -524,22 +548,76 @@ export class ClaudeExecutor {
   async *cliExecute(options: ExecutorOptions): AsyncGenerator<SDKMessage> {
     const { prompt, cwd, sessionId, abortController, outputsDir } = options;
 
-    this.logger.info(
-      { cwd, hasSession: !!sessionId, claudePath: CLAUDE_EXECUTABLE },
-      'Starting Claude CLI execute (-p stream-json)',
-    );
-
     if (abortController.signal.aborted) {
       return;
     }
 
     const args = this.buildCliArgs(prompt, sessionId, outputsDir);
-    const child = spawn(CLAUDE_EXECUTABLE, args, {
-      cwd,
-      env: this.buildCliEnv(),
-      signal: abortController.signal,
-      stdio: ['ignore', 'pipe', 'pipe'],
+    // Strip the trailing prompt when logging args to avoid dumping user input
+    const argsForLog = args.slice(0, -1);
+
+    this.logger.info(
+      {
+        mode: 'cli',
+        claudePath: CLAUDE_EXECUTABLE,
+        cwd,
+        hasSession: !!sessionId,
+        promptChars: prompt.length,
+        model: this.config.claude.model,
+        args: argsForLog,
+      },
+      '[claude] invoking CLI (claude -p stream-json)',
+    );
+
+    // Pre-flight: if we resolved an absolute path that no longer exists
+    // (common with nvm node-version switches), short-circuit to an error
+    // result so `startExecution` can fall back to the SDK path instead of
+    // crashing on an uncaught ENOENT from spawn.
+    if (path.isAbsolute(CLAUDE_EXECUTABLE) && !fs.existsSync(CLAUDE_EXECUTABLE)) {
+      const msg = `claude binary not found at ${CLAUDE_EXECUTABLE} (set CLAUDE_EXECUTABLE_PATH to override)`;
+      this.logger.warn({ mode: 'cli', claudePath: CLAUDE_EXECUTABLE }, `[claude] ${msg}`);
+      yield {
+        type: 'result',
+        subtype: 'error',
+        is_error: true,
+        result: msg,
+        errors: [msg],
+      } as SDKMessage;
+      return;
+    }
+
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(CLAUDE_EXECUTABLE, args, {
+        cwd,
+        env: this.buildCliEnv(),
+        signal: abortController.signal,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch (err: any) {
+      const msg = String(err?.message ?? err);
+      this.logger.warn({ mode: 'cli', claudePath: CLAUDE_EXECUTABLE, err }, '[claude] spawn threw synchronously');
+      yield {
+        type: 'result',
+        subtype: 'error',
+        is_error: true,
+        result: msg,
+        errors: [msg],
+      } as SDKMessage;
+      return;
+    }
+
+    // Attach 'error' listener SYNCHRONOUSLY (before any await) so async spawn
+    // failures (ENOENT, EACCES, etc.) never escape as unhandled events and
+    // crash the process. Captured here and surfaced as an error-result so the
+    // fallback path in `startExecution` can take over.
+    let spawnError: Error | null = null;
+    child.on('error', (err: Error) => {
+      spawnError = err;
+      this.logger.warn({ mode: 'cli', claudePath: CLAUDE_EXECUTABLE, err }, '[claude] CLI spawn error');
     });
+
+    this.logger.debug({ mode: 'cli', pid: child.pid }, '[claude] CLI process spawned');
 
     let stderr = '';
     child.stderr?.on('data', (chunk: unknown) => {
@@ -555,6 +633,21 @@ export class ClaudeExecutor {
         reject(new DOMException('Aborted', 'AbortError'));
       }, { once: true });
     });
+
+    // Give any synchronous-style spawn error (e.g. ENOENT) a tick to surface
+    // via the 'error' listener before we start awaiting stdout.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    if (spawnError) {
+      const msg = String((spawnError as Error).message ?? spawnError);
+      yield {
+        type: 'result',
+        subtype: 'error',
+        is_error: true,
+        result: msg,
+        errors: [msg],
+      } as SDKMessage;
+      return;
+    }
 
     const rl = readline.createInterface({
       input: child.stdout!,
@@ -572,12 +665,12 @@ export class ClaudeExecutor {
         try {
           yield JSON.parse(trimmed) as SDKMessage;
         } catch {
-          this.logger.debug({ line: trimmed.slice(0, 120) }, 'cliExecute: skip non-JSON line');
+          this.logger.debug({ line: trimmed.slice(0, 120) }, '[claude] CLI: skip non-JSON line');
         }
       }
     } catch (err: any) {
       if (err.name === 'AbortError' || abortController.signal.aborted) {
-        this.logger.info('Claude CLI execution aborted');
+        this.logger.info({ mode: 'cli', pid: child.pid }, '[claude] CLI execution aborted');
         return;
       }
       throw err;
@@ -585,19 +678,29 @@ export class ClaudeExecutor {
       rl.close();
     }
 
+    // 'error' may fire mid-stream (e.g. child crashes). Surface as terminal
+    // error-result so fallback path can trigger.
+    if (spawnError) {
+      const msg = String((spawnError as Error).message ?? spawnError);
+      yield {
+        type: 'result',
+        subtype: 'error',
+        is_error: true,
+        result: msg,
+        errors: [msg],
+      } as SDKMessage;
+      return;
+    }
+
     let exitCode: number | null = null;
     try {
-      const exitPromise = once(child, 'exit');
-      const errorPromise = new Promise<never>((_, reject) => {
-        child.once('error', reject);
-      });
-      const [code] = await Promise.race([exitPromise, errorPromise]);
+      const [code] = await once(child, 'exit');
       exitCode = code;
     } catch (err: any) {
       if (err.name === 'AbortError' || abortController.signal.aborted) {
         return;
       }
-      this.logger.warn({ err }, 'cliExecute: process error');
+      this.logger.warn({ mode: 'cli', pid: child.pid, err }, '[claude] CLI process error');
       yield {
         type: 'result',
         subtype: 'error',
@@ -609,7 +712,7 @@ export class ClaudeExecutor {
     }
 
     if (exitCode !== 0 && exitCode !== null && !abortController.signal.aborted) {
-      this.logger.warn({ exitCode, stderr: stderr.slice(-2000) }, 'cliExecute: non-zero exit');
+      this.logger.warn({ mode: 'cli', pid: child.pid, exitCode, stderr: stderr.slice(-2000) }, '[claude] CLI non-zero exit');
       yield {
         type: 'result',
         subtype: 'error',
@@ -617,6 +720,8 @@ export class ClaudeExecutor {
         result: stderr || `claude exited with code ${exitCode}`,
         errors: [stderr || `exit ${exitCode}`],
       } as SDKMessage;
+    } else {
+      this.logger.info({ mode: 'cli', pid: child.pid, exitCode }, '[claude] CLI execution finished');
     }
   }
 }
