@@ -53,6 +53,32 @@ function hasCredentialsFile(): boolean {
 }
 
 /**
+ * Prepend directories that contain a usable `node` binary to PATH so any
+ * `#!/usr/bin/env node` shebang in the Claude Code script can resolve its
+ * interpreter. Fixes `ENOENT` ambiguity on Linux, where `execve` reports
+ * the script path even when the missing piece is the shebang interpreter.
+ *
+ * - `dirname(CLAUDE_EXECUTABLE)`: npm/nvm-installed CLIs live next to `node`.
+ * - `dirname(process.execPath)`: the Node binary currently running metabot.
+ *
+ * Returns a new env object; input is not mutated.
+ */
+function augmentPathForClaude(env: Record<string, string>): Record<string, string> {
+  const extraPaths: string[] = [];
+  if (path.isAbsolute(CLAUDE_EXECUTABLE)) {
+    extraPaths.push(path.dirname(CLAUDE_EXECUTABLE));
+  }
+  try { extraPaths.push(path.dirname(process.execPath)); } catch { /* ignore */ }
+
+  const sep = isWindows ? ';' : ':';
+  const basePath = env.PATH || env.Path || env.path || '';
+  const existing = new Set(basePath.split(sep).filter(Boolean));
+  const prefix = extraPaths.filter((p) => p && !existing.has(p)).join(sep);
+  if (!prefix) return env;
+  return { ...env, PATH: basePath ? `${prefix}${sep}${basePath}` : prefix };
+}
+
+/**
  * Create a custom spawn function for cross-platform compatibility.
  * - Uses process.execPath (current Node binary) to avoid PATH issues on Windows.
  * - Always filters CLAUDE* env vars to prevent nested session errors.
@@ -87,12 +113,21 @@ function createSpawnFn(explicitApiKey?: string): (options: SpawnOptions) => Spaw
       env.ANTHROPIC_API_KEY = explicitApiKey;
     }
 
+    // Prepend claude/node dirs to PATH so shebang interpreter resolves
+    // (see augmentPathForClaude and cliExecute for the same treatment).
+    const finalEnv = augmentPathForClaude(env);
+
     const child = spawn(nodePath, options.args, {
       cwd: options.cwd,
-      env,
+      env: finalEnv,
       signal: options.signal,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
+
+    // Prevent unhandled 'error' events (e.g. ENOENT) from crashing the process
+    // before the SDK attaches its own listener. The SDK will still receive
+    // the event via its own listener.
+    child.on('error', () => { /* swallow; SDK handles */ });
 
     return child as unknown as SpawnedProcess;
   };
@@ -233,22 +268,7 @@ export class ClaudeExecutor {
     if (this.config.claude.apiKey) {
       env.ANTHROPIC_API_KEY = this.config.claude.apiKey;
     }
-
-    const extraPaths: string[] = [];
-    if (path.isAbsolute(CLAUDE_EXECUTABLE)) {
-      extraPaths.push(path.dirname(CLAUDE_EXECUTABLE));
-    }
-    try {
-      extraPaths.push(path.dirname(process.execPath));
-    } catch { /* ignore */ }
-
-    const sep = isWindows ? ';' : ':';
-    const basePath = env.PATH || env.Path || env.path || '';
-    const existing = new Set(basePath.split(sep).filter(Boolean));
-    const prefix = extraPaths.filter((p) => p && !existing.has(p)).join(sep);
-    env.PATH = prefix ? (basePath ? `${prefix}${sep}${basePath}` : prefix) : basePath;
-
-    return env;
+    return augmentPathForClaude(env);
   }
 
   /**
