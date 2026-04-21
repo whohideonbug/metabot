@@ -211,7 +211,20 @@ export class ClaudeExecutor {
     return appendSections;
   }
 
-  /** Environment for a direct `claude` subprocess (inherits `process.env`, optional API key from bot config). */
+  /**
+   * Environment for a direct `claude` subprocess.
+   *
+   * Critical: Linux `execve` returns `ENOENT` both when the script itself is
+   * missing AND when the script's shebang interpreter (typically
+   * `#!/usr/bin/env node`) cannot be resolved. When metabot runs under a
+   * stripped PATH (systemd/pm2/sudo/root), the child inherits that PATH and
+   * `env node` can't be located even though `claude` exists — the spawn
+   * error confusingly points at `claude` itself.
+   *
+   * To make the CLI path robust, we prepend the `claude` binary's directory
+   * (where `node` typically lives alongside npm-installed CLIs under nvm)
+   * AND the directory of the current Node process to `PATH`.
+   */
   private buildCliEnv(): Record<string, string> {
     const env: Record<string, string> = {};
     for (const [k, v] of Object.entries(process.env)) {
@@ -220,6 +233,21 @@ export class ClaudeExecutor {
     if (this.config.claude.apiKey) {
       env.ANTHROPIC_API_KEY = this.config.claude.apiKey;
     }
+
+    const extraPaths: string[] = [];
+    if (path.isAbsolute(CLAUDE_EXECUTABLE)) {
+      extraPaths.push(path.dirname(CLAUDE_EXECUTABLE));
+    }
+    try {
+      extraPaths.push(path.dirname(process.execPath));
+    } catch { /* ignore */ }
+
+    const sep = isWindows ? ';' : ':';
+    const basePath = env.PATH || env.Path || env.path || '';
+    const existing = new Set(basePath.split(sep).filter(Boolean));
+    const prefix = extraPaths.filter((p) => p && !existing.has(p)).join(sep);
+    env.PATH = prefix ? (basePath ? `${prefix}${sep}${basePath}` : prefix) : basePath;
+
     return env;
   }
 
@@ -556,19 +584,6 @@ export class ClaudeExecutor {
     // Strip the trailing prompt when logging args to avoid dumping user input
     const argsForLog = args.slice(0, -1);
 
-    this.logger.info(
-      {
-        mode: 'cli',
-        claudePath: CLAUDE_EXECUTABLE,
-        cwd,
-        hasSession: !!sessionId,
-        promptChars: prompt.length,
-        model: this.config.claude.model,
-        args: argsForLog,
-      },
-      '[claude] invoking CLI (claude -p stream-json)',
-    );
-
     // Pre-flight: if we resolved an absolute path that no longer exists
     // (common with nvm node-version switches), short-circuit to an error
     // result so `startExecution` can fall back to the SDK path instead of
@@ -586,11 +601,39 @@ export class ClaudeExecutor {
       return;
     }
 
+    // Read the shebang so we can tell the user exactly which interpreter
+    // spawn failed to resolve when ENOENT strikes. Kept cheap and best-effort.
+    let shebang: string | undefined;
+    try {
+      if (path.isAbsolute(CLAUDE_EXECUTABLE)) {
+        const head = fs.readFileSync(CLAUDE_EXECUTABLE, { encoding: 'utf-8', flag: 'r' }).slice(0, 256);
+        const firstLine = head.split(/\r?\n/, 1)[0];
+        if (firstLine?.startsWith('#!')) shebang = firstLine;
+      }
+    } catch { /* ignore */ }
+
+    const cliEnv = this.buildCliEnv();
+
+    this.logger.info(
+      {
+        mode: 'cli',
+        claudePath: CLAUDE_EXECUTABLE,
+        cwd,
+        hasSession: !!sessionId,
+        promptChars: prompt.length,
+        model: this.config.claude.model,
+        args: argsForLog,
+        shebang,
+        pathHead: cliEnv.PATH?.split(isWindows ? ';' : ':').slice(0, 4),
+      },
+      '[claude] invoking CLI (claude -p stream-json)',
+    );
+
     let child: ReturnType<typeof spawn>;
     try {
       child = spawn(CLAUDE_EXECUTABLE, args, {
         cwd,
-        env: this.buildCliEnv(),
+        env: cliEnv,
         signal: abortController.signal,
         stdio: ['ignore', 'pipe', 'pipe'],
       });
